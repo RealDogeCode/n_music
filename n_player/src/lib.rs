@@ -1,3 +1,4 @@
+use crate::settings::Settings;
 use bitcode::{Decode, Encode};
 use multitag::data::Picture;
 use multitag::Tag;
@@ -22,13 +23,22 @@ unsafe impl Sync for TrackData {}
 #[no_mangle]
 fn android_main(app: slint::android::AndroidApp) {
     use crate::app::run_app;
-    slint::android::init(app).unwrap();
+    slint::android::init(app.clone()).unwrap();
+    let mut settings = Settings::read_saved_android(app.clone());
+    if !Path::new(&settings.path).exists() {
+        settings.path = app
+            .external_data_path()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(async {
-            run_app().await;
+            run_app(settings, app).await;
         });
 }
 
@@ -43,8 +53,13 @@ pub fn get_image<P: AsRef<Path> + Debug>(path: P) -> Vec<u8> {
                     if let Some(cover) = cover {
                         return cover.data;
                     }
+                } else if let Tag::Id3Tag { inner } = tag {
+                    let cover = inner.pictures().next().cloned().map(Picture::from);
+                    if let Some(cover) = cover {
+                        return cover.data;
+                    }
                 } else {
-                    eprintln!("not an opus tag {path:?}");
+                    eprintln!("not an opus or mp3 tag {path:?}");
                 }
             }
         } else {
@@ -59,25 +74,24 @@ pub async fn add_all_tracks_to_player<P: AsRef<Path> + AsRef<OsStr> + From<Strin
     player: &mut QueuePlayer,
     path: P,
 ) {
-    let mut dir = tokio::fs::read_dir(path)
-        .await
-        .expect("Can't read files in the chosen directory");
-    let mut paths = vec![];
-    while let Ok(Some(file)) = dir.next_entry().await {
-        if file.file_type().await.unwrap().is_file() {
-            if let Ok(Some(mime)) = infer::get_from_path(&file.path()) {
-                if mime.mime_type().contains("audio") {
-                    let mut p = file.path().to_str().unwrap().to_string();
-                    p.shrink_to_fit();
-                    paths.push(p);
+    if let Ok(mut dir) = tokio::fs::read_dir(path).await {
+        let mut paths = vec![];
+        while let Ok(Some(file)) = dir.next_entry().await {
+            if file.file_type().await.unwrap().is_file() {
+                if let Ok(Some(mime)) = infer::get_from_path(&file.path()) {
+                    if mime.mime_type().contains("audio") {
+                        let mut p = file.path().to_str().unwrap().to_string();
+                        p.shrink_to_fit();
+                        paths.push(p);
+                    }
                 }
             }
         }
-    }
-    player.add_all(paths).await.unwrap();
-    player.shrink_to_fit();
+        player.add_all(paths).await.unwrap();
+        player.shrink_to_fit();
 
-    player.shuffle();
+        player.shuffle();
+    }
 }
 
 #[derive(Copy, Clone, Debug, Decode, Encode)]
