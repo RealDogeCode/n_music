@@ -6,25 +6,28 @@ use crate::localization::{get_locale_denominator, localize};
 use crate::runner::{run, Runner, RunnerMessage, RunnerSeek};
 use crate::settings::Settings;
 use crate::{
-    add_all_tracks_to_player, bus_server, get_image, AppData, Localization, MainWindow,
+    add_all_tracks_to_player, bus_server, get_image, AppData, FileTrack, Localization, MainWindow,
     SettingsData, Theme, TrackData, WindowSize,
 };
 use flume::{Receiver, Sender};
-use image::imageops::FilterType;
-use image::ImageFormat;
 #[cfg(target_os = "linux")]
 use mpris_server::Server;
 use n_audio::music_track::MusicTrack;
 use n_audio::queue::QueuePlayer;
 use n_audio::remove_ext;
+use rimage::operations::resize::{FilterType, ResizeAlg};
 use slint::{ComponentHandle, VecModel};
 use std::cell::RefCell;
-use std::io::Cursor;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::sync::RwLock;
+use zune_core::bytestream::ZCursor;
+use zune_core::colorspace::ColorSpace;
+use zune_core::options::DecoderOptions;
+use zune_image::image::Image;
+use zune_image::traits::OperationsTrait;
+use zune_imageprocs::crop::Crop;
 
 pub async fn run_app(
     settings: Settings,
@@ -53,6 +56,11 @@ pub async fn run_app(
         main_window.global::<Localization>(),
     );
 
+    let check_timestamp = settings.borrow().check_timestamp().await;
+    let is_cached = !check_timestamp
+        && !settings.borrow().tracks.is_empty()
+        && settings.borrow().tracks.len() == len;
+
     #[cfg(target_os = "android")]
     let a = app.clone();
     let future = tokio::spawn(async move {
@@ -65,32 +73,53 @@ pub async fn run_app(
 
         let runner_future = tokio::task::spawn(run(r.clone(), rx));
         let bus_future = tokio::task::spawn(bus_server::run(server, r.clone(), tmp));
-        #[cfg(not(target_os = "android"))]
-        let loader_future = tokio::task::spawn(loader(r.clone(), tx_l));
-        #[cfg(target_os = "android")]
-        let loader_future = {
-            let app = a.clone();
-            tokio::task::spawn(loader(r.clone(), tx_l, app))
-        };
+        if !is_cached {
+            #[cfg(not(target_os = "android"))]
+            let loader_future = tokio::task::spawn(loader(r.clone(), tx_l));
+            #[cfg(target_os = "android")]
+            let loader_future = {
+                let app = a.clone();
+                tokio::task::spawn(loader(r.clone(), tx_l, app))
+            };
 
-        let _ = tokio::join!(runner_future, bus_future, loader_future);
+            let _ = tokio::join!(runner_future, bus_future, loader_future);
+        } else {
+            let _ = tokio::join!(runner_future, bus_future);
+        }
     });
 
     let mut tracks = vec![];
     for i in 0..len {
-        let track_path = runner.read().await.get_path_for_file(i).await;
-        tracks.push(TrackData {
-            artist: Default::default(),
-            cover: Default::default(),
-            time: Default::default(),
-            title: remove_ext(track_path).into(),
-            index: i as i32,
-        });
+        let track_path = runner.read().await.get_path_for_file(i).await.unwrap();
+        if is_cached {
+            let track_without_ext = remove_ext(track_path);
+            if let Some(file_track) = settings
+                .borrow()
+                .tracks
+                .iter()
+                .find(|file_track| file_track.path == track_without_ext)
+            {
+                let mut track: TrackData = file_track.clone().into();
+                track.index = i as i32;
+                tracks.push(track)
+            }
+        } else {
+            tracks.push(TrackData {
+                artist: Default::default(),
+                cover: Default::default(),
+                time: Default::default(),
+                title: remove_ext(track_path).into(),
+                index: i as i32,
+            });
+        }
     }
+    let tracks_len = tracks.len();
 
     let settings_data = main_window.global::<SettingsData>();
     let app_data = main_window.global::<AppData>();
 
+    #[cfg(target_os = "android")]
+    app_data.set_android(true);
     app_data.set_version(env!("CARGO_PKG_VERSION").into());
 
     settings_data.set_color_scheme(settings.borrow().theme.into());
@@ -191,6 +220,7 @@ pub async fn run_app(
     app_data.on_searching(move |searching| tx_searching.send(searching.to_string()).unwrap());
     let window = main_window.as_weak();
     let r = runner.clone();
+    let (tx_t, rx_t) = flume::unbounded();
     let updater = tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
         let mut searching = String::new();
@@ -213,9 +243,10 @@ pub async fn run_app(
 
             let mut new_loaded = false;
             while let Ok(track_data) = rx_l.try_recv() {
-                if let Some(track_data) = track_data {
-                    let index = track_data.index as usize;
-                    tracks[index] = track_data;
+                if let Some((index, file_track)) = track_data {
+                    tx_t.send_async(file_track.clone()).await.unwrap();
+                    tracks[index] = file_track.into();
+                    tracks[index].index = index as i32;
                     loaded += 1;
                     if loaded % threshold == 0 {
                         new_loaded = true;
@@ -299,6 +330,11 @@ pub async fn run_app(
 
     updater.abort();
     future.abort();
+    let tracks: Vec<FileTrack> = rx_t.iter().collect();
+    if tracks.len() == tracks_len {
+        settings.borrow_mut().tracks = tracks;
+        settings.borrow_mut().save_timestamp().await;
+    }
     #[cfg(not(target_os = "android"))]
     settings.borrow_mut().save().await;
     #[cfg(target_os = "android")]
@@ -306,7 +342,7 @@ pub async fn run_app(
 }
 async fn loader_task(
     runner: Arc<RwLock<Runner>>,
-    tx: Sender<Option<TrackData>>,
+    tx: Sender<Option<(usize, FileTrack)>>,
     rx_l: Arc<tokio::sync::Mutex<Receiver<usize>>>,
     #[cfg(target_os = "android")] app: slint::android::AndroidApp,
 ) {
@@ -318,66 +354,63 @@ async fn loader_task(
                 }
                 return;
             }
-            let path = runner.read().await.get_path_for_file(index).await;
-            if let Ok(track) = MusicTrack::new(path.to_string_lossy().to_string()) {
-                if let Ok(Ok(meta)) = tokio::task::spawn_blocking(move || track.get_meta()).await {
-                    let p = path.clone();
-                    let image_path = if let Ok(mut image) =
-                        tokio::task::spawn_blocking(move || get_image(p)).await
+            if let Some(path) = runner.read().await.get_path_for_file(index).await {
+                if let Ok(track) = MusicTrack::new(path.to_string_lossy().to_string()) {
+                    if let Ok(Ok(meta)) =
+                        tokio::task::spawn_blocking(move || track.get_meta()).await
                     {
-                        if !image.is_empty() {
-                            if let Err(e) = image::load_from_memory(&image)
-                                .unwrap()
-                                .resize_to_fill(128, 128, FilterType::Lanczos3)
-                                .to_rgb8()
-                                .write_to(&mut Cursor::new(&mut image), ImageFormat::Jpeg)
-                            {
-                                eprintln!(
-                                    "error happened during image resizing and conversion: {e}"
-                                );
-                            }
-
-                            #[cfg(not(target_os = "android"))]
-                            let images_dir = Settings::app_dir().join("images");
-                            #[cfg(target_os = "android")]
-                            let images_dir = Settings::app_dir(&app).join("images");
-                            if !images_dir.exists() {
-                                if let Err(e) = tokio::fs::create_dir(images_dir.as_path()).await {
-                                    eprintln!("error happened during dir creation: {e}");
+                        let p = path.clone();
+                        let image = if let Ok(image) =
+                            tokio::task::spawn_blocking(move || get_image(p)).await
+                        {
+                            if !image.is_empty() {
+                                let mut zune_image =
+                                    Image::read(ZCursor::new(image), DecoderOptions::new_fast())
+                                        .unwrap();
+                                zune_image.convert_color(ColorSpace::RGB).unwrap();
+                                let (width, height) = zune_image.dimensions();
+                                if width != height {
+                                    let difference = width.abs_diff(height);
+                                    let min = width.min(height);
+                                    let is_height = height < width;
+                                    let x = if is_height { difference / 2 } else { 0 };
+                                    let y = if !is_height { difference / 2 } else { 0 };
+                                    tokio::task::block_in_place(|| {
+                                        Crop::new(min, min, x, y).execute(&mut zune_image).unwrap()
+                                    });
                                 }
-                            }
-                            let path = images_dir.join(format!("{}.jpg", remove_ext(path)));
-                            if let Err(e) = tokio::fs::write(path.as_path(), image).await {
-                                eprintln!("error happened during image writing: {e}");
-                            }
-                            path
-                        } else {
-                            PathBuf::new().join("thisdoesntexistsodontworryaboutit")
-                        }
-                    } else {
-                        PathBuf::new().join("thisdoesntexistsodontworryaboutit")
-                    };
-
-                    if let Err(e) = tx
-                        .send_async(Some(TrackData {
-                            artist: meta.artist.into(),
-                            time: format!(
-                                "{:02}:{:02}",
-                                (meta.time.length / 60.0).floor() as u64,
-                                meta.time.length.floor() as u64 % 60
-                            )
-                            .into(),
-                            cover: if image_path.exists() {
-                                slint::Image::load_from_path(&image_path).unwrap()
+                                tokio::task::block_in_place(|| {
+                                    rimage::operations::resize::Resize::new(
+                                        128,
+                                        128,
+                                        ResizeAlg::Convolution(FilterType::Hamming),
+                                    )
+                                    .execute(&mut zune_image)
+                                    .unwrap()
+                                });
+                                zune_image.flatten_to_u8()[0].clone()
                             } else {
-                                Default::default()
-                            },
-                            title: meta.title.into(),
-                            index: index as i32,
-                        }))
-                        .await
-                    {
-                        eprintln!("error happened during metadata transfer, probably because the app was closed: {e}");
+                                vec![]
+                            }
+                        } else {
+                            vec![]
+                        };
+
+                        if let Err(e) = tx
+                            .send_async(Some((
+                                index,
+                                FileTrack {
+                                    path: remove_ext(path),
+                                    title: meta.title,
+                                    artist: meta.artist,
+                                    length: meta.time.length,
+                                    image,
+                                },
+                            )))
+                            .await
+                        {
+                            eprintln!("error happened during metadata transfer, probably because the app was closed: {e}");
+                        }
                     }
                 }
             }
@@ -387,14 +420,14 @@ async fn loader_task(
 
 async fn loader(
     runner: Arc<RwLock<Runner>>,
-    tx: Sender<Option<TrackData>>,
+    tx: Sender<Option<(usize, FileTrack)>>,
     #[cfg(target_os = "android")] app: slint::android::AndroidApp,
 ) {
     let len = runner.read().await.len();
     let mut tasks = vec![];
     let (tx_l, rx_l) = flume::unbounded();
     let rx_l = Arc::new(tokio::sync::Mutex::new(rx_l));
-    let cpus = num_cpus::get() * 2;
+    let cpus = num_cpus::get() * 4;
     for _ in 0..cpus {
         let runner = runner.clone();
         let tx = tx.clone();

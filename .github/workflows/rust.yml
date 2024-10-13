@@ -164,8 +164,16 @@ jobs:
         uses: actions/checkout@v3
       - name: Cache build
         uses: Swatinem/rust-cache@v2
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
       - name: Setup
         run: |
+          sdkmanager "platform-tools" "platforms;android-30"
           rustup toolchain install nightly
           rustup component add rust-src --toolchain nightly
           rustup default nightly
@@ -192,20 +200,23 @@ jobs:
               echo '[target.${{ matrix.target }}]'>>.cargo/config
               echo "linker = \"$TARGET_CC\"">>.cargo/config
           fi
-          echo "${{ secrets.KEYSTORE_CONTENT }}" > n_music.keystore
+          echo ${{ secrets.KEYSTORE_CONTENT }} | base64 --decode > "n_player/n_music.keystore"
+          echo -e "[package.metadata.android.signing.release]\n" >> n_player/Cargo.toml
+          echo -e "path = "n_music.keystore"\n" >> n_player/Cargo.toml
+          echo "keystore_password = \"${{ secrets.KEYSTORE_PASSWORD }}\"" >> n_player/Cargo.toml
           
           sudo ln -fs /usr/bin/mold /usr/bin/ld
       - name: Build ${{ matrix.target }}
         run: |
-          PKG_CONFIG_SYSROOT_DIR=/ ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME CARGO_APK_RELEASE_KESYTORE=n_music.keystore CARGO_APK_RELEASE_KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }} cargo apk build --target=${{ matrix.target }} --package n_player --release
+          PKG_CONFIG_SYSROOT_DIR=/ ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME cargo apk build --lib --target=${{ matrix.target }} --package n_player --release
       - name: Upload n_music-${{ matrix.target }}.apk
         uses: actions/upload-artifact@v3
         with:
           name: ${{ env.CRATE_NAME }}-${{ matrix.target }}.apk
-          path: target/release/N Music.apk
+          path: target/release/apk/N Music.apk
       - name: Publish in release
         uses: softprops/action-gh-release@v1
         if: github.ref_type == 'tag'
         with:
           files: |
-            target/release/N Music.apk
+            target/release/apk/N Music.apk
