@@ -1,9 +1,9 @@
-use crate::settings::Settings;
 use bitcode::{Decode, Encode};
 use multitag::data::Picture;
 use multitag::Tag;
 use n_audio::queue::QueuePlayer;
 use slint::private_unstable_api::re_exports::ColorScheme;
+use slint::SharedPixelBuffer;
 use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::path::Path;
@@ -23,8 +23,10 @@ unsafe impl Sync for TrackData {}
 #[no_mangle]
 fn android_main(app: slint::android::AndroidApp) {
     use crate::app::run_app;
+    use crate::settings::Settings;
+
     slint::android::init(app.clone()).unwrap();
-    let mut settings = Settings::read_saved_android(app.clone());
+    let mut settings = Settings::read_saved_android(&app);
     if !Path::new(&settings.path).exists() {
         settings.path = app
             .external_data_path()
@@ -103,7 +105,7 @@ pub struct WindowSize {
 impl Default for WindowSize {
     fn default() -> Self {
         Self {
-            width: 500,
+            width: 450,
             height: 625,
         }
     }
@@ -174,6 +176,36 @@ impl TryFrom<i32> for Theme {
             Ok(Self::Dark)
         } else {
             Err(format!("{value} is not a valid theme"))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Decode, Encode)]
+pub struct FileTrack {
+    pub path: String,
+    pub title: String,
+    pub artist: String,
+    pub length: f64,
+    pub image: Vec<u8>,
+}
+
+impl From<FileTrack> for TrackData {
+    fn from(value: FileTrack) -> Self {
+        Self {
+            artist: value.artist.into(),
+            cover: if !value.image.is_empty() {
+                slint::Image::from_rgb8(SharedPixelBuffer::clone_from_slice(&value.image, 128, 128))
+            } else {
+                Default::default()
+            },
+            index: 0,
+            time: format!(
+                "{:02}:{:02}",
+                (value.length / 60.0).floor() as u64,
+                value.length.floor() as u64 % 60
+            )
+            .into(),
+            title: value.title.into(),
         }
     }
 }
