@@ -16,6 +16,7 @@ export component App {
         }
 
         ListView {
+            z: -1;
             viewport-width: parent.width - 20px;
             for track[i] in AppData.tracks: Track {
                 track: track;

@@ -1,15 +1,39 @@
 import { Button, ProgressIndicator, LineEdit, Palette } from "std-widgets.slint";
 import { Localization } from "../globals/localization.slint";
 import { AppData } from "../globals/app_data.slint";
+import { PopupMenu } from "./context_menu.slint";
 
 export component TopPanel {
     callback settings();
+    property <bool> add_song: true;
+
+    popup := PopupMenu {
+        items: ["From File", "From YouTube"];
+        visible: false;
+
+        choice(item) => {
+            debug(item);
+        }
+    }
+
     VerticalLayout {
         spacing: 10px;
         padding: 10px;
         padding-bottom: 5px;
         HorizontalLayout {
             spacing: 10px;
+
+            Button {
+                icon: @image-url("../../assets/icons/add.svg");
+                colorize-icon: true;
+
+                clicked => {
+                    add_song ? popup.show_at(5px,45px) : popup.close();
+
+                    add_song = !add_song;
+                }
+            }
+
             LineEdit {
                 placeholder-text: Localization.search;
                 edited(value) => {

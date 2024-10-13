@@ -1,0 +1,34 @@
+import {Palette, ListView, Button} from "std-widgets.slint";
+
+export component PopupMenu {
+    in property <[string]> items;
+    callback choice(string);
+
+    public function show_at(x: length, y: length) {
+        root.width = 100px;
+        root.height = (items.length * 40px);
+        root.x = x;
+        root.y = y;
+        self.visible = true;
+    }
+
+    public function close() {
+        self.visible = false;
+    }
+
+    Rectangle {
+        background: Palette.alternate-background;
+        border-radius: 5px;
+        width: 100px;
+        height: root.height;
+        VerticalLayout {
+            for item in items: Button{
+                text: item;
+
+                clicked => {
+                    choice(item);
+                }
+            }
+        }
+    }
+}
