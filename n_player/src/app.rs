@@ -14,6 +14,7 @@ use rimage::codecs::webp::WebPDecoder;
 use rimage::operations::resize::{FilterType, ResizeAlg};
 use slint::{ComponentHandle, VecModel};
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
@@ -158,6 +159,27 @@ pub async fn run_app<P: Platform + Send + 'static>(settings: Settings, platform:
         })
         .unwrap();
     });
+
+    let s = settings.clone();
+    let p = platform.clone();
+    app_data.on_on_add_song_from_file(move || {
+        let s = s.clone();
+        let p = p.clone();
+        slint::spawn_local(async move {
+            let path = p.lock().await.ask_file();
+            let settings = s.lock().await;
+            let music_path = Path::new(&settings.path);
+            let dest_path = &music_path.join(&path.get(0).unwrap().file_name().unwrap().to_str().unwrap());
+
+            tokio::fs::File::create(dest_path).await.expect("Error creating the file...");
+
+            if let Err(e) = tokio::fs::copy(&path.get(0).unwrap(), dest_path).await {
+                eprintln!("Error Copying File: {:?}", e);
+                return;
+            }
+        }).expect("Something went south");
+    });
+
     let s = settings.clone();
     let p = platform.clone();
     settings_data.on_path(move || {
