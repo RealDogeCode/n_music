@@ -5,17 +5,9 @@ import { PopupMenu } from "./context_menu.slint";
 
 export component TopPanel {
     callback settings();
+    callback on_from_file();
     property <bool> add_song: true;
-
-    popup := PopupMenu {
-        items: ["From File", "From YouTube"];
-        visible: false;
-
-        choice(item) => {
-            debug(item);
-        }
-    }
-
+    
     VerticalLayout {
         spacing: 10px;
         padding: 10px;
@@ -29,7 +21,13 @@ export component TopPanel {
                 colorize-icon: true;
 
                 clicked => {
-                    add_song ? popup.show_at(5px,45px) : popup.close();
+                    if(add_song){
+                        popup.visible = true;
+                    }
+                    else
+                    {
+                        popup.visible = false;
+                    }
 
                     add_song = !add_song;
                 }
@@ -62,6 +60,22 @@ export component TopPanel {
 
         ProgressIndicator {
             progress <=> AppData.progress;
+        }
+    }
+    HorizontalLayout {
+        alignment: start;
+        padding-left: 5px;
+        popup := PopupMenu {
+            items: ["From File", "From YouTube"];
+            visible: false;
+            y: 60px;
+            z: 100;
+
+            choice(item) => {
+                if(item == "From File"){
+                    AppData.on_add_song_from_file();
+                }
+            }
         }
     }
 }

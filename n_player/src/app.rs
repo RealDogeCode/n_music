@@ -18,10 +18,12 @@ use n_audio::remove_ext;
 use rimage::operations::resize::{FilterType, ResizeAlg};
 use slint::{ComponentHandle, VecModel};
 use std::cell::RefCell;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::sync::RwLock;
+use tokio::fs;
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
@@ -118,6 +120,30 @@ pub async fn run_app(
     let settings_data = main_window.global::<SettingsData>();
     let app_data = main_window.global::<AppData>();
 
+    let window = main_window.as_weak();
+
+    app_data.on_on_add_song_from_file(move || {
+        let window = window.clone();
+        window.upgrade_in_event_loop(move |window| {
+            slint::spawn_local(async move {
+                if let Some(file) = rfd::AsyncFileDialog::new().pick_file().await {
+                    let current_path = window.global::<SettingsData>().get_current_path().to_string();
+
+                    let source_path = file.path();
+                    let dest_path = Path::new(&current_path);
+
+
+                    tokio::fs::File::create(dest_path.join(source_path.file_name().unwrap())).await.expect("Error creating the file...");
+
+                    if let Err(e) = tokio::fs::copy(&source_path, dest_path.join(source_path.file_name().unwrap())).await {
+                        eprintln!("Error Copying File: {:?}", e);
+                        return;
+                    }
+                }
+            }).expect("Something went south...");
+        }).unwrap();
+    });
+
     #[cfg(target_os = "android")]
     app_data.set_android(true);
     app_data.set_version(env!("CARGO_PKG_VERSION").into());
@@ -182,6 +208,7 @@ pub async fn run_app(
     #[cfg(not(target_os = "android"))]
     let window = main_window.as_weak();
     #[cfg(not(target_os = "android"))]
+
     settings_data.on_path(move || {
         let window = window.clone();
         slint::spawn_local(async move {
