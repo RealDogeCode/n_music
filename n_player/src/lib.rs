@@ -1,7 +1,11 @@
 use bitcode::{Decode, Encode};
+#[cfg(target_os = "android")]
+use flume::{Receiver, RecvError, SendError, Sender, TryRecvError};
 use multitag::data::Picture;
 use multitag::Tag;
 use n_audio::queue::QueuePlayer;
+#[cfg(target_os = "android")]
+use once_cell::sync::Lazy;
 use slint::private_unstable_api::re_exports::ColorScheme;
 use slint::SharedPixelBuffer;
 use std::ffi::OsStr;
@@ -13,6 +17,7 @@ slint::include_modules!();
 pub mod app;
 pub mod bus_server;
 pub mod localization;
+pub mod platform;
 pub mod runner;
 pub mod settings;
 
@@ -20,27 +25,106 @@ unsafe impl Send for TrackData {}
 unsafe impl Sync for TrackData {}
 
 #[cfg(target_os = "android")]
+pub struct SenderReceiver<M> {
+    tx: Sender<M>,
+    rx: Receiver<M>,
+}
+
+#[cfg(target_os = "android")]
+impl<M> SenderReceiver<M> {
+    pub fn new() -> Self {
+        let (tx, rx) = flume::unbounded();
+        Self { tx, rx }
+    }
+
+    pub fn send(&self, message: M) -> Result<(), SendError<M>> {
+        self.tx.send(message)
+    }
+
+    pub fn recv(&self) -> Result<M, RecvError> {
+        self.rx.recv()
+    }
+
+    pub fn try_recv(&self) -> Result<M, TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    pub async fn send_async(&self, message: M) -> Result<(), SendError<M>> {
+        self.tx.send_async(message).await
+    }
+
+    pub async fn recv_async(&self) -> Result<M, RecvError> {
+        self.rx.recv_async().await
+    }
+}
+
+#[cfg(target_os = "android")]
+pub static ANDROID_RX: Lazy<SenderReceiver<MessageRustToAndroid>> =
+    Lazy::new(|| SenderReceiver::new());
+#[cfg(target_os = "android")]
+pub static ANDROID_TX: Lazy<SenderReceiver<MessageAndroidToRust>> =
+    Lazy::new(|| SenderReceiver::new());
+
+#[cfg(target_os = "android")]
+pub enum MessageAndroidToRust {
+    Directory(String),
+    Start(jni::JavaVM, jni::objects::GlobalRef),
+}
+#[cfg(target_os = "android")]
+pub enum MessageRustToAndroid {
+    AskDirectory,
+    OpenLink(String),
+}
+
+#[cfg(target_os = "android")]
 #[no_mangle]
 fn android_main(app: slint::android::AndroidApp) {
     use crate::app::run_app;
+    use crate::platform::AndroidPlatform;
+    use crate::platform::Platform;
     use crate::settings::Settings;
+    use slint::platform::WindowEvent;
+    use std::sync::Arc;
 
     slint::android::init(app.clone()).unwrap();
-    let mut settings = Settings::read_saved_android(&app);
-    if !Path::new(&settings.path).exists() {
-        settings.path = app
-            .external_data_path()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
+    let platform = if let Ok(MessageAndroidToRust::Start(jvm, callback)) = ANDROID_TX.recv() {
+        Arc::new(std::sync::Mutex::new(AndroidPlatform::new(
+            app, jvm, callback,
+        )))
+    } else {
+        unreachable!()
+    };
+
+    let settings = Arc::new(std::sync::Mutex::new(Settings::read_saved(
+        platform.lock().unwrap(),
+    )));
+    if !Path::new(&settings.lock().unwrap().path).exists() {
+        let window = AndroidWindow::new().unwrap();
+        let handle = window.as_weak();
+        let settings = settings.clone();
+        let platform = platform.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            let path = platform.lock().unwrap().ask_music_dir();
+            settings.lock().unwrap().path = path.to_str().unwrap().to_string();
+            handle
+                .upgrade_in_event_loop(|window| {
+                    window.window().dispatch_event(WindowEvent::CloseRequested);
+                })
+                .unwrap();
+        });
+        window.run().unwrap();
     }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap()
         .block_on(async {
-            run_app(settings, app).await;
+            run_app(
+                Arc::into_inner(settings).unwrap().into_inner().unwrap(),
+                Arc::into_inner(platform).unwrap().into_inner().unwrap(),
+            )
+            .await;
         });
 }
 
@@ -190,7 +274,10 @@ pub struct FileTrack {
 }
 
 impl From<FileTrack> for TrackData {
-    fn from(value: FileTrack) -> Self {
+    fn from(mut value: FileTrack) -> Self {
+        value.artist.shrink_to_fit();
+        value.title.shrink_to_fit();
+        value.image.shrink_to_fit();
         Self {
             artist: value.artist.into(),
             cover: if !value.image.is_empty() {
@@ -208,4 +295,36 @@ impl From<FileTrack> for TrackData {
             title: value.title.into(),
         }
     }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_com_enn3developer_n_1music_MainActivity_gotDirectory<'local>(
+    mut env: jni::JNIEnv<'local>,
+    _class: jni::objects::JClass<'local>,
+    string: jni::objects::JString<'local>,
+) {
+    ANDROID_TX
+        .send(MessageAndroidToRust::Directory(
+            env.get_string(&string)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ))
+        .unwrap()
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_com_enn3developer_n_1music_MainActivity_start<'local>(
+    env: jni::JNIEnv<'local>,
+    _class: jni::objects::JClass<'local>,
+    callback: jni::objects::JObject<'local>,
+) {
+    let jvm = env.get_java_vm().unwrap();
+    let callback = env.new_global_ref(callback).unwrap();
+    ANDROID_TX
+        .send(MessageAndroidToRust::Start(jvm, callback))
+        .unwrap()
 }

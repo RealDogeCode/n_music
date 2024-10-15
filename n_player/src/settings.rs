@@ -1,8 +1,11 @@
+use crate::platform::Platform;
 use crate::{FileTrack, Theme, WindowSize};
 use bitcode::{Decode, Encode};
-use hashbrown::DefaultHashBuilder;
 use std::fs;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::fs::File;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{BufReader, BufWriter, Cursor};
+use std::ops::Deref;
 use std::path::PathBuf;
 
 #[derive(Debug, Decode, Encode)]
@@ -20,52 +23,30 @@ pub struct Settings {
 impl Settings {
     fn read_from_file(storage_file: PathBuf) -> Self {
         if storage_file.exists() && storage_file.is_file() {
-            let storage_content = fs::read(storage_file).unwrap();
-            if let Ok(storage) = bitcode::decode(&storage_content) {
-                storage
+            let mut data = vec![];
+            if let Ok(_) = zstd::stream::copy_decode(
+                File::open(storage_file).unwrap(),
+                BufWriter::new(Cursor::new(&mut data)),
+            ) {
+                if let Ok(storage) = bitcode::decode(&data) {
+                    storage
+                } else {
+                    eprintln!("not encoded");
+                    Self::default()
+                }
             } else {
+                eprintln!("bad file");
                 Self::default()
             }
         } else {
+            eprintln!("file not found");
             Self::default()
         }
     }
 
-    #[cfg(target_os = "android")]
-    pub fn read_saved_android(app: &slint::android::AndroidApp) -> Self {
-        let config_dir = Self::app_dir(app);
-        if !config_dir.exists() {
-            fs::create_dir(&config_dir).unwrap();
-        }
-        let storage_file = config_dir.join("config");
+    pub fn read_saved<P: Deref<Target = impl Platform>>(platform: P) -> Self {
+        let storage_file = platform.internal_dir().join("config");
         Self::read_from_file(storage_file)
-    }
-
-    #[cfg(not(target_os = "android"))]
-    pub async fn read_saved() -> Self {
-        let storage_file = Self::app_dir().join("config");
-
-        tokio::task::spawn_blocking(|| Self::read_from_file(storage_file))
-            .await
-            .unwrap()
-    }
-
-    #[cfg(target_os = "android")]
-    pub fn app_dir(app: &slint::android::AndroidApp) -> PathBuf {
-        app.external_data_path()
-            .expect("can't get external data path")
-            .join("config/")
-    }
-
-    #[cfg(not(target_os = "android"))]
-    pub fn app_dir() -> PathBuf {
-        let base_dirs = directories::BaseDirs::new().unwrap();
-        let local_data_dir = base_dirs.data_local_dir();
-        let app_dir = local_data_dir.join("n_music");
-        if !app_dir.exists() {
-            fs::create_dir(app_dir.as_path()).unwrap();
-        }
-        app_dir
     }
 
     #[cfg(target_os = "android")]
@@ -91,7 +72,7 @@ impl Settings {
 
     pub async fn check_timestamp(&self) -> bool {
         if let Some(saved_timestamp) = &self.timestamp {
-            let mut hasher = DefaultHashBuilder::default().build_hasher();
+            let mut hasher = DefaultHasher::default();
             tokio::fs::metadata(&self.path)
                 .await
                 .unwrap()
@@ -105,10 +86,9 @@ impl Settings {
         }
     }
 
-    pub async fn save_timestamp(&mut self) {
-        let mut hasher = DefaultHashBuilder::default().build_hasher();
-        tokio::fs::metadata(&self.path)
-            .await
+    pub fn save_timestamp(&mut self) {
+        let mut hasher = DefaultHasher::default();
+        fs::metadata(&self.path)
             .unwrap()
             .modified()
             .unwrap()
@@ -117,24 +97,24 @@ impl Settings {
         self.timestamp = Some(timestamp);
     }
 
-    #[cfg(not(target_os = "android"))]
-    pub async fn save(&self) {
-        let storage_file = Self::app_dir().join("config");
-        tokio::fs::write(storage_file, bitcode::encode(self))
-            .await
-            .unwrap();
+    pub async fn save<P: Deref<Target = impl Platform>>(&self, platform: P) {
+        self.save_and_compress(platform.internal_dir()).await
     }
 
-    #[cfg(target_os = "android")]
-    pub async fn save(&self, app: &slint::android::AndroidApp) {
-        let config_dir = Self::app_dir(app);
-        if !config_dir.exists() {
-            tokio::fs::create_dir(&config_dir).await.unwrap();
-        }
+    async fn save_and_compress(&self, config_dir: PathBuf) {
         let storage_file = config_dir.join("config");
-        tokio::fs::write(storage_file, bitcode::encode(self))
-            .await
+        if storage_file.exists() {
+            tokio::fs::remove_file(&storage_file).await.unwrap();
+        }
+        let data = bitcode::encode(self);
+        tokio::task::spawn_blocking(|| {
+            zstd::stream::copy_encode(
+                BufReader::new(Cursor::new(data)),
+                File::create(storage_file).unwrap(),
+                9,
+            )
             .unwrap();
+        });
     }
 }
 
