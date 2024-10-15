@@ -35,7 +35,7 @@ pub async fn run_app<P: Platform + Send + 'static>(settings: Settings, platform:
 
     let mut player = QueuePlayer::new(settings.lock().await.path.clone());
     add_all_tracks_to_player(&mut player, settings.lock().await.path.clone()).await;
-    let len = player.len();
+    let len = player.len() as u16;
 
     let runner = Arc::new(RwLock::new(Runner::new(player)));
 
@@ -193,7 +193,7 @@ pub async fn run_app<P: Platform + Send + 'static>(settings: Settings, platform:
         .unwrap();
     });
     let t = tx.clone();
-    app_data.on_clicked(move |i| t.send(RunnerMessage::PlayTrack(i as usize)).unwrap());
+    app_data.on_clicked(move |i| t.send(RunnerMessage::PlayTrack(i as u16)).unwrap());
     let t = tx.clone();
     app_data.on_play_previous(move || t.send(RunnerMessage::PlayPrevious).unwrap());
     let t = tx.clone();
@@ -216,7 +216,7 @@ pub async fn run_app<P: Platform + Send + 'static>(settings: Settings, platform:
     let updater = tokio::task::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
         let mut searching = String::new();
-        let mut old_index = usize::MAX;
+        let mut old_index = u16::MAX;
         let mut loaded = 0;
         let threshold = num_cpus::get() * 4;
         let mut saved = false;
@@ -239,8 +239,8 @@ pub async fn run_app<P: Platform + Send + 'static>(settings: Settings, platform:
                 if let Some((index, file_track)) = track_data {
                     let file = file_track.clone();
                     s.lock().await.tracks.push(file);
-                    tracks[index] = file_track.into();
-                    tracks[index].index = index as i32;
+                    tracks[index as usize] = file_track.into();
+                    tracks[index as usize].index = index as i32;
                     loaded += 1;
                     if loaded % threshold == 0 {
                         new_loaded = true;
@@ -248,7 +248,7 @@ pub async fn run_app<P: Platform + Send + 'static>(settings: Settings, platform:
                 } else {
                     if !saved {
                         saved = true;
-                        s.lock().await.save_timestamp();
+                        s.lock().await.save_timestamp().await;
                         s.lock().await.save(p.lock().await).await;
                     }
                     new_loaded = true;
@@ -257,8 +257,10 @@ pub async fn run_app<P: Platform + Send + 'static>(settings: Settings, platform:
             let progress = loaded as f64 / tracks.len() as f64;
             let mut playing_track = None;
             if old_index != index || new_loaded {
-                playing_track = Some(tracks[index].clone());
-                old_index = index;
+                if let Some(track) = tracks.get(index as usize) {
+                    playing_track = Some(track.clone());
+                    old_index = index;
+                }
             }
 
             let mut updated_search = false;
@@ -285,6 +287,8 @@ pub async fn run_app<P: Platform + Send + 'static>(settings: Settings, platform:
                     })
                     .collect();
             }
+
+            p.lock().await.tick();
 
             window
                 .upgrade_in_event_loop(move |window| {
@@ -333,12 +337,12 @@ pub async fn run_app<P: Platform + Send + 'static>(settings: Settings, platform:
 }
 async fn loader_task(
     runner: Arc<RwLock<Runner>>,
-    tx: Sender<Option<(usize, FileTrack)>>,
-    rx_l: Arc<Mutex<Receiver<usize>>>,
+    tx: Sender<Option<(u16, FileTrack)>>,
+    rx_l: Arc<Mutex<Receiver<u16>>>,
 ) {
     loop {
         if let Ok(index) = rx_l.lock().await.recv_async().await {
-            if index == usize::MAX {
+            if index == u16::MAX {
                 if let Err(e) = tx.send_async(None).await {
                     eprintln!("error happened when signaling end of task, probably because the app was closed: {e}");
                 }
@@ -427,7 +431,7 @@ async fn loader_task(
     }
 }
 
-async fn loader(runner: Arc<RwLock<Runner>>, tx: Sender<Option<(usize, FileTrack)>>) {
+async fn loader(runner: Arc<RwLock<Runner>>, tx: Sender<Option<(u16, FileTrack)>>) {
     let len = runner.read().await.len();
     let mut tasks = vec![];
     let (tx_l, rx_l) = flume::unbounded();
@@ -440,10 +444,10 @@ async fn loader(runner: Arc<RwLock<Runner>>, tx: Sender<Option<(usize, FileTrack
         tasks.push(tokio::task::spawn(loader_task(runner, tx, rx_l)));
     }
     for i in 0..len {
-        tx_l.send_async(i).await.unwrap();
+        tx_l.send_async(i as u16).await.unwrap();
     }
     for _ in 0..cpus {
-        tx_l.send_async(usize::MAX).await.unwrap();
+        tx_l.send_async(u16::MAX).await.unwrap();
     }
     for task in tasks {
         task.await.unwrap();
